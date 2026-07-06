@@ -1,6 +1,6 @@
 ---
 name: find-unresolved-issues
-description: Find genuinely unresolved GitHub issues — open, unassigned, no linked PR, no fix-in-progress. Filters out issues that appear open but are effectively resolved. Excludes bot-only engagement.
+description: Find genuinely unresolved GitHub issues — open, unassigned, no linked PR, no fix-in-progress. Filters out issues that appear open but are effectively resolved.
 triggers:
   - "找 issue"
   - "找未解决的 issue"
@@ -21,189 +21,189 @@ An issue is "truly unresolved" when ALL of these hold:
 
 1. **Open** — not closed
 2. **No linked PR** — no PR that closes/fixes it
-3. **No fix-in-progress** — no human comment saying "working on this" or "PR coming" (bot comments don't count)
+3. **No fix-in-progress** — no comment saying "working on this" or "PR coming"
 4. **Not superseded** — another issue or PR didn't make this one redundant
 5. **No merged fix** — no merged PR that references this issue number in its body ("fixes #NNN" / "closes #NNN")
 
-Common traps:
+Common traps to avoid:
 - Issue #2674 (HugeGraph) looked open but PR #2982 had already implemented it
-- Issues whose only comment is from a bot (Dosu, dependabot) — looks engaged but is untouched
-- "I'll follow up on this after #XXXX" — soft claim, someone is waiting to work on it
-- Maintainer asks "is this by design?" — the issue may not be a real bug
+- Issues with "duplicate of #XXX" in comments — actually resolved
+- Issues where the last comment is "fixed in commit abc123" — check the commit
 
-## The Pipeline (4-Layer Filter)
+## Method 1: GitHub Search API (fast, programmatic)
 
-Always follow this order to minimize API calls:
-
-```
-  Layer 0: Search broadly → get candidates
-  Layer 1: Filter in Python (labels, comment count, bot-only detection)  
-  Layer 2: Cross-ref check (timeline API) + merged PR search
-  Layer 3: Read issue body + human comments for claim/fix signals
-```
-
-Layer 3 is the most expensive (one `gh issue view` per candidate). Run Layer 2 first to eliminate issues before hitting Layer 3.
-
-## Layer 0: Search for Candidates
+Use the GitHub Search API to find candidates, then filter:
 
 ```
 gh search issues --repo <owner/repo> \
-  --state open is:issue \
-  --limit 40 \
-  --json number,title,labels,commentsCount,createdAt,updatedAt
+  --state open \
+  --label "good first issue,help wanted" \
+  --limit 30 \
+  --no-assignee \
+  --json number,title,labels,assignees,comments,createdAt,updatedAt
 ```
 
-Key points:
-- **Always include `is:issue`** — without it, PRs leak into results
-- **The JSON field is `commentsCount`** (NOT `comments`) — using `comments` causes "Unknown JSON field" error
-- **DO NOT use `--sort`** — `--sort comments --order asc` returns 0 results with `is:issue`. Filter programmatically instead
-- **Label negation is unreliable** — `-label:question` may return empty. Filter labels in Python
-- **`--no-assignee` is optional** — use it for repos with many stale assignees, but skip it if you want to catch issues where the assignee has abandoned them (check last activity date)
-- **`--limit 40`** is a good default — enough breadth, won't blow through API rate limits in Layer 2/3
+Key flags:
+- `--no-assignee` — skip issues someone already claimed
+- `--label "good first issue"` — beginner-friendly
+- Combine labels with commas for OR: `--label "good first issue,help wanted"`
 
-## Layer 1: Programmatic Filter
+Then for each candidate, check if it's really unresolved:
+
+### Step 1: Check for linked PRs
+```
+gh api "repos/<owner>/<repo>/issues/<number>/timeline" \
+  --jq '.[] | select(.event == "cross-referenced") | .source.issue.pull_request.url'
+```
+If ANY cross-referenced event points to a PR → issue may already be handled.
+
+### Step 2: Check merged PRs that reference this issue  
+```
+gh search prs --repo <owner>/<repo> \
+  --state merged \
+  "<issue number> in:body" \
+  --json number,title,state,mergedAt
+```
+This catches PRs that say "Fixes #NNN" or "Closes #NNN" in their body. Crucial — GitHub auto-closes doesn't always work, so the issue stays open.
+
+### Step 3: Read recent comments
+```
+gh issue view <number> --repo <owner>/<repo> --comments --json comments
+```
+Look for:
+- "duplicate of" / "dup of"
+- "fixed in" / "resolved by"
+- "working on this" / "I'll take this"
+- "PR: #NNNN" / "see #NNNN"
+- "不再维护" / "won't fix" / "这个已经在版本 X 修了"
+
+### Step 4: Check for commits referencing the issue
+```
+gh search commits --repo <owner>/<repo> \
+  "#<number>" \
+  --json sha,commit
+```
+Some repos merge fixes without a PR or the PR body doesn't reference the issue.
+
+## Method 2: Browser-based (for repos without gh CLI)
+
+1. Navigate to `https://github.com/<owner>/<repo>/issues?q=is:open+is:issue+no:assignee+label:"good+first+issue"`
+2. For each candidate issue, check:
+   - Scroll to bottom — any "linked pull request" in the sidebar?
+   - Read last 3 comments — anyone claimed it?
+   - Search the repo for PRs mentioning this issue number
+3. Use `browser_console` to run JS that scrapes issue metadata
+
+## Method 3: Bulk Python Script
 
 ```python
-import json, subprocess
+import subprocess, json
 
-# Run the search
-result = subprocess.run([...], capture_output=True, text=True)
-issues = json.loads(result.stdout)
-
-# Filter candidates
-candidates = []
-for issue in issues:
-    labels = [l["name"] for l in issue.get("labels", [])]
-    cc = issue.get("commentsCount", 0)
+def find_truly_open(repo, labels="good first issue", limit=20):
+    """Find issues that are genuinely unresolved."""
+    # 1. Get open, unassigned issues
+    result = subprocess.run([
+        "gh", "search", "issues", "--repo", repo,
+        "--state", "open", "--no-assignee",
+        "--label", labels, "--limit", str(limit),
+        "--json", "number,title,labels,createdAt,updatedAt"
+    ], capture_output=True, text=True)
+    issues = json.loads(result.stdout)
     
-    # Skip: questions, inactive, meta/summary/track/epic
-    if "question" in labels or "inactive" in labels:
-        continue
-    title_lower = issue["title"].lower()
-    if any(kw in title_lower for kw in ["summary", "track", "epic", "roadmap"]):
-        continue
+    truly_open = []
+    for issue in issues:
+        num = issue["number"]
+        print(f"Checking #{num}: {issue['title'][:60]}...")
+        
+        # 2. Check for cross-referenced PRs (timeline)
+        tl = subprocess.run([
+            "gh", "api",
+            f"repos/{repo}/issues/{num}/timeline",
+            "--jq", '[.[] | select(.event=="cross-referenced") | select(.source.issue.pull_request != null)] | length'
+        ], capture_output=True, text=True)
+        pr_refs = int(tl.stdout.strip() or 0)
+        
+        # 3. Check merged PRs mentioning this issue
+        prs = subprocess.run([
+            "gh", "search", "prs", "--repo", repo,
+            "--state", "merged", f"#{num} in:body",
+            "--json", "number", "--limit", "1"
+        ], capture_output=True, text=True)
+        merged_prs = len(json.loads(prs.stdout))
+        
+        if pr_refs > 0 or merged_prs > 0:
+            print(f"  SKIP #{num}: has linked PR or merged fix")
+            continue
+        
+        # 4. Check recent comments for claim/fix signals
+        comments = subprocess.run([
+            "gh", "issue", "view", str(num), "--repo", repo,
+            "--comments", "--json", "comments"
+        ], capture_output=True, text=True)
+        comments_data = json.loads(comments.stdout)
+        last_comments = [c["body"] for c in comments_data.get("comments", [])[-3:]]
+        
+        skip_phrases = [
+            "duplicate of", "dup of", "fixed in", "resolved by",
+            "working on this", "I'll take this", "PR: #", "see #",
+            "不再维护", "won't fix", "已经在版本", "close?",
+            "addressed in", "solved by", "已修复", "已解决"
+        ]
+        if any(any(phrase in c.lower() for phrase in skip_phrases) for c in last_comments):
+            print(f"  SKIP #{num}: comments indicate it's resolved or claimed")
+            continue
+        
+        truly_open.append(issue)
+        print(f"  ✓ #{num} is GENUINELY OPEN")
     
-    # Skip: graduation/trademark (not code)
-    if "graduation" in labels:
-        continue
-    
-    candidates.append(issue)
+    return truly_open
 ```
-
-## Layer 2: Cross-Referenced PRs + Merged PR Search
-
-For each candidate from Layer 1, run these BEFORE reading issue body/comments:
-
-```python
-# Check 1: Cross-referenced PRs via timeline
-tl = subprocess.run([
-    "gh", "api", f"repos/{repo}/issues/{num}/timeline",
-    "--jq", '[.[] | select(.event=="cross-referenced") | select(.source.issue.pull_request != null)] | length'
-], capture_output=True, text=True, timeout=12)
-
-# Check 2: Merged PRs that mention this issue
-prs = subprocess.run([
-    "gh", "search", "prs", "--repo", repo,
-    "--state", "merged", f"#{num} in:body",
-    "--json", "number", "--limit", "1"
-], capture_output=True, text=True, timeout=12)
-```
-
-If either check returns results → SKIP. This is the fastest elimination step.
-
-## Layer 3: Issue Body + Human Comments
-
-```python
-view = subprocess.run([
-    "gh", "issue", "view", str(num), "--repo", repo,
-    "--comments", "--json", "body,comments"
-], capture_output=True, text=True, timeout=12)
-
-data = json.loads(view.stdout)
-```
-
-### CRITICAL: Filter Out Bot Comments First
-
-Many repos have automated bots. Their comments look like engagement but are NOT human. **Always filter out bot comments before scanning for claims.**
-
-```python
-KNOWN_BOTS = {
-    "dosubot", "dependabot", "github-actions", "codecov",
-    "renovate", "stale", "imgbot", "allcontributors",
-    "sonarcloud", "coveralls", "sizebot", "changeset-bot"
-}
-
-human_comments = [
-    c for c in data.get("comments", [])
-    if c["author"]["login"].lower() not in KNOWN_BOTS
-]
-```
-
-An issue whose **only** comments are from bots is effectively untouched — treat it as available.
-
-### Skip Phrases (check against issue body + human comments)
-
-These indicate the issue is resolved, claimed, or not a real bug:
-
-```
-In English:
-  "duplicate of", "dup of", "fixed in", "resolved by",
-  "working on this", "i'll take this", "i'll follow up",
-  "follow up on this", "i will work", "i am working",
-  "i'm on it", "assign me", "let me handle", "taking this",
-  "pr: #", "see #", "won't fix", "wontfix",
-  "addressed in", "solved by", "close?",
-  "no longer relevant", "already in", "not a bug",
-  "is this by design", "is this intended"
-
-In Chinese / mixed:
-  "已经在版本", "已修复", "已解决", "不再维护",
-  "这个在版本 X 修了", "已有 pr", "已经被修复",
-  "设计如此", "不是 bug", "预期行为"
-```
-
-### Red Flag: Maintainer "Design Philosophy" Questions
-
-If a maintainer comments asking whether behavior is "by design" or "is this intended" — the issue is likely NOT a real bug. Flag these for the user but don't auto-skip (sometimes the maintainer is wrong).
 
 ## Output Format
 
-Present results as a ranked table with Why It's Safe column:
+Present results as a table:
 
 | # | Title | Labels | Age | Why It's Safe |
 |---|-------|--------|-----|---------------|
-| 2756 | Port 8080 false positive | bug | 14mo | No PR refs, no cross-refs, only bot comment, no human claims |
+| 2345 | Fix Dockerfile entrypoint | good first issue | 3mo | No PR refs, no claim, no merged fix |
 
-Sort by recommendation: smallest scope + clearest reproduction steps first. Mark top picks with ★.
+Include a "Why It's Safe" column — this is the evidence you checked. Never present an issue as "good to work on" without this evidence.
+
+## Red Flags (auto-skip)
+
+When scanning an issue, skip immediately if you see ANY of:
+
+In the issue body or comments:
+- `Duplicate of #`
+- `dup of #`
+- `Fixed in`
+- `Resolved by #`
+- `PR #` (as a fix reference)
+- `已经在版本 X 修了` / `这个在版本 X 已解决`
+- `Won't fix` / `Working as intended`
+- `I'm working on this` / `I'll submit a PR`
+
+In the timeline/sidebar:
+- Linked pull requests in the sidebar
+- Cross-referenced PR events
+- A commit that says "fixes #NNN"
+
+In the repo:
+- A merged PR whose body contains `#<issue_number>` — even if the issue is still open!
+- A commit whose message contains `#<issue_number>` on main/master branch
+
+## For Chinese/Self-Hosted Repos
+
+Some repos use Gitee, GitLab, or self-hosted Gitea. The same logic applies but:
+- Gitee API: `https://gitee.com/api/v5/repos/<owner>/<repo>/issues`
+- GitLab API: `https://gitlab.com/api/v4/projects/<id>/issues`
+- Always check if the repo has a "已解决"/"已修复" label that the maintainer forgot to apply
 
 ## After Finding Issues
 
-1. Present the filtered list to the user with Why It's Safe evidence
+1. Present the filtered list to the user
 2. Let them pick, or recommend based on:
-   - **Scope clarity** — is the fix well-defined or vague?
-   - **Reproduction steps** — can you reproduce without a complex cluster setup?
-   - **Labels** — good first issue > help wanted > bug > feature > empty
-   - **Age** — older = less likely someone is secretly working on it
-   - **Human comments** — 0-2 human comments = less competition
-3. Before starting work, comment on the issue: "I'd like to work on this" — give maintainers 24h to respond
-
-## Rate Limiting
-
-The timeline API check (Layer 2) is the bottleneck. For GitHub.com:
-- Authenticated: 5,000 requests/hour
-- Each candidate costs ~3 API calls (timeline + search prs + issue view)
-- With 40 candidates from Layer 0 and ~50% filtered by Layer 2, ~15 reach Layer 3
-- Total: ~40 (search) + ~40 (timeline) + ~40 (search prs) + ~15 (issue view) ≈ 135 calls
-- Well within limits; but for repos with 100+ open issues, batch in groups of 40
-
-## Real-World Example (HugeGraph)
-
-A session found 40 open non-question issues. After the 4-layer pipeline:
-- Layer 1 filtered to ~15 candidates (excluded questions, meta, graduation)
-- Layer 2 eliminated 5 (cross-referenced PRs) + 0 (merged PR mentions)
-- Layer 3 eliminated 2 more (soft claims like "I'll follow up after #2994")
-
-Final 3 genuinely unresolved:
-- #2756 — Port 8080 false positive (★ best scope)
-- #2745 — DEFAULT_CAPACITY configurable (★ clearest requirements)
-- #2801 — PostgreSQL connection leak (★ highest practical impact)
+   - Age (older = less likely someone is secretly working on it)
+   - Labels (good first issue > help wanted > no label)
+   - Comments count (0-2 comments = less competition)
+3. Before starting work, comment on the issue: "I'd like to work on this" — give maintainers 24h to respond before submitting a PR
